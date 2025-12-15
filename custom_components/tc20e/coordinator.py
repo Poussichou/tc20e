@@ -12,13 +12,16 @@ from bs4 import BeautifulSoup
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_AUTHENTICATION
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import DOMAIN, LOGGER, MIN_SCAN_INTERVAL, TC20E_URL
 
-TIMEOUT = 15
+# Global timeout for HTTP calls to TC20E.
+# The backend is known to be very slow, so keep this relatively high
+# to reduce spurious timeouts while still failing eventually.
+TIMEOUT = 30
 
 
 class TC20EUpdateCoordinator(DataUpdateCoordinator):
@@ -26,13 +29,15 @@ class TC20EUpdateCoordinator(DataUpdateCoordinator):
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         """Initialize the TC20E Coordinator."""
-
         self.websession = async_get_clientsession(hass)
         self._authid: str = entry.data[CONF_AUTHENTICATION]
         self._session_id: str | None = None
+
         self._timesync = MIN_SCAN_INTERVAL
         self.alarmstatus = 0
-        self.request = False
+
+        # Serialize all requests to TC20E to avoid concurrent sessions and deadlocks.
+        self._request_lock = asyncio.Lock()
 
         super().__init__(
             hass,
@@ -43,7 +48,6 @@ class TC20EUpdateCoordinator(DataUpdateCoordinator):
 
     async def setalarm(self, command: str) -> None:
         """Change status of alarm."""
-
         try:
             if command == "full":
                 await self._request(
@@ -63,7 +67,7 @@ class TC20EUpdateCoordinator(DataUpdateCoordinator):
                 )
                 self.alarmstatus = 100
 
-        except (UpdateFailed, ConfigEntryAuthFailed, CannotConnectError) as error:
+        except (UpdateFailed, CannotConnectError, AuthenticationError) as error:
             raise HomeAssistantError(
                 f"Could not arm/disarm TC20E on error {error!s}"
             ) from error
@@ -72,15 +76,13 @@ class TC20EUpdateCoordinator(DataUpdateCoordinator):
 
     async def _async_update_data(self) -> None:
         """Fetch info from TC20E."""
-
         LOGGER.debug("Trying to get Alarm status")
 
         try:
             await self._request(
                 TC20E_URL + "/applicationservice/domoweb/panel/commands/status"
             )
-
-        except (UpdateFailed, ConfigEntryAuthFailed, CannotConnectError) as error:
+        except (UpdateFailed, CannotConnectError, AuthenticationError) as error:
             raise HomeAssistantError(
                 f"Could not retrieve alarm status on error {error!s}"
             ) from error
@@ -88,186 +90,181 @@ class TC20EUpdateCoordinator(DataUpdateCoordinator):
         # await self.async_request_refresh()
 
     async def _request(self, url: str) -> None:
-        if self.request is True:
-            LOGGER.debug("Another request session in progress, waiting")
+        """Perform a serialized request to TC20E and update alarmstatus.
 
-            while self.request is True:
-                await asyncio.sleep(1)
-                LOGGER.debug("Trying again")
-
-        self.request = True
-
-        try:
-            async with asyncio.timeout(TIMEOUT):
-                await self._login()
-
-        except TimeoutError as error:
-            LOGGER.warning("Timeout during login %s", str(error))
-            self.request = False
-            raise CannotConnectError from error
-
-        LOGGER.debug("Login passed")
-
-        headers = {
-            "x-session-token": self._session_id,
-        }
-        params = {
-            "isBusy": "true",
-            "checkCompletion": "true",
-        }
-        json = {
-            "key": "",
-            "value": "",
-        }
-
-        try:
-            async with asyncio.timeout(TIMEOUT):
-                response = await self.websession.put(
-                    url, headers=headers, params=params, json=json
-                )
-
-        except TimeoutError as error:
-            LOGGER.warning("Timeout when sending command to TC20E")
-            await self._logout()
-            raise CannotConnectError from error
-
-        except Exception as error:
-            LOGGER.debug("Exception on request: %s", error)
-            await self._logout()
-            raise UpdateFailed from error
-
-        LOGGER.debug("Command response status: %s", response.status)
-
-        if response.status == 200:
+        This method must never leave the coordinator in a locked/broken state.
+        Any network/DNS error should fail the current update, but the next update
+        must be able to run normally without requiring an integration reload.
+        """
+        async with self._request_lock:
             try:
-                json = await response.json()
-                json_id = json["id"]
-                json_status = json["status"]
+                # Login and retrieve a session token.
+                try:
+                    async with asyncio.timeout(TIMEOUT):
+                        await self._login()
+                except TimeoutError as error:
+                    LOGGER.warning("Timeout during login: %s", str(error))
+                    raise CannotConnectError from error
 
-            except aiohttp.ContentTypeError as error:
-                LOGGER.debug("ContentTypeError on ok status: %s", error.message)
-                response_text = await response.text()
-                LOGGER.debug("Response (200) text is: %s", response_text)
-                await self._logout()
-                raise UpdateFailed from error
+                LOGGER.debug("Login passed")
 
-            if json_status == "success":
-                LOGGER.debug("Command successfull, URL: %s", url)
+                headers = {
+                    "x-session-token": self._session_id,
+                }
+                params = {
+                    "isBusy": "true",
+                    "checkCompletion": "true",
+                }
+                json_payload = {
+                    "key": "",
+                    "value": "",
+                }
 
-                statuscode = 0
+                # Send the command/status request.
+                try:
+                    async with asyncio.timeout(TIMEOUT):
+                        response = await self.websession.put(
+                            url, headers=headers, params=params, json=json_payload
+                        )
+                except TimeoutError as error:
+                    LOGGER.warning("Timeout when sending command to TC20E")
+                    raise CannotConnectError from error
+                except Exception as error:
+                    LOGGER.debug("Exception on request: %s", error)
+                    raise UpdateFailed from error
 
-                while statuscode != 2:
+                LOGGER.debug("Command response status: %s", response.status)
+
+                if response.status == 200:
                     try:
-                        async with asyncio.timeout(TIMEOUT):
-                            response = await self.websession.get(
-                                url + "/" + str(json_id) + "/status",
-                                headers=headers,
-                            )
-
-                    except TimeoutError as error:
-                        LOGGER.warning("Timeout when sending command to TC20E")
-                        await self._logout()
-                        raise CannotConnectError from error
-
-                    except Exception as error:
-                        LOGGER.debug("Exception on request: %s", error)
-                        await self._logout()
+                        data = await response.json()
+                        json_id = data["id"]
+                        json_status = data["status"]
+                    except aiohttp.ContentTypeError as error:
+                        LOGGER.debug("ContentTypeError on ok status: %s", error.message)
+                        response_text = await response.text()
+                        LOGGER.debug("Response (200) text is: %s", response_text)
                         raise UpdateFailed from error
 
-                    if response.status == 200:
-                        LOGGER.debug("Command response status: %s", response.status)
+                    if json_status == "success":
+                        LOGGER.debug("Command successful, URL: %s", url)
 
-                        try:
-                            json = await response.json()
-                            statuscode = json["statusCode"]
-                            messagekey = json["messageKey"]
-                            errorcode = json["errorCode"]
+                        statuscode = 0
+                        messagekey = None
+                        errorcode = None
 
-                        except aiohttp.ContentTypeError as error:
-                            LOGGER.debug(
-                                "ContentTypeError on ok status: %s", error.message
-                            )
-                            response_text = await response.text()
-                            LOGGER.debug("Response (200) text is: %s", response_text)
-                            await self._logout()
-                            raise UpdateFailed from error
+                        # Poll the status endpoint until completion.
+                        while statuscode != 2:
+                            try:
+                                async with asyncio.timeout(TIMEOUT):
+                                    response = await self.websession.get(
+                                        f"{url}/{json_id}/status",
+                                        headers=headers,
+                                    )
+                            except TimeoutError as error:
+                                LOGGER.warning("Timeout while polling TC20E status")
+                                raise CannotConnectError from error
+                            except Exception as error:
+                                LOGGER.debug("Exception on request: %s", error)
+                                raise UpdateFailed from error
 
-                        LOGGER.debug("Command response Status Code: %s", statuscode)
+                            if response.status == 200:
+                                LOGGER.debug(
+                                    "Command poll response status: %s", response.status
+                                )
+                                try:
+                                    data = await response.json()
+                                    statuscode = data["statusCode"]
+                                    messagekey = data.get("messageKey")
+                                    errorcode = data.get("errorCode")
+                                except aiohttp.ContentTypeError as error:
+                                    LOGGER.debug(
+                                        "ContentTypeError on ok status: %s",
+                                        error.message,
+                                    )
+                                    response_text = await response.text()
+                                    LOGGER.debug("Response (200) text is: %s", response_text)
+                                    raise UpdateFailed from error
 
-                    await asyncio.sleep(1)
+                                LOGGER.debug("Command response Status Code: %s", statuscode)
+
+                            await asyncio.sleep(1)
+
+                            # Code 6 is "too long" in the original implementation.
+                            if statuscode == 6:
+                                LOGGER.debug("Status code is 6 -> Too long, aborting")
+                                self.alarmstatus = 0
+                                raise UpdateFailed
+
+                        LOGGER.debug("Status Code is: %s", statuscode)
+                        LOGGER.debug("Error Code is: %s", errorcode)
+                        LOGGER.debug("Message is: %s", messagekey)
+
+                        if errorcode is not None:
+                            self.alarmstatus = errorcode
+
+                        return
+
+                if response.status == 201:
+                    try:
+                        data = await response.json()
+                        statuscode = data["statusCode"]
+                        messagekey = data.get("messageKey")
+                        errorcode = data.get("errorCode")
+                    except aiohttp.ContentTypeError as error:
+                        LOGGER.debug("ContentTypeError on ok status: %s", error.message)
+                        response_text = await response.text()
+                        LOGGER.debug("Response (201) text is: %s", response_text)
+                        raise UpdateFailed from error
 
                     if statuscode == 6:
-                        LOGGER.debug("Status code is 6 -> Toolong, aborting")
-                        await self._logout()
+                        LOGGER.debug("Status code is 6 -> Too long, aborting")
                         self.alarmstatus = 0
                         raise UpdateFailed
 
-            LOGGER.debug("Status Code is: %s", statuscode)
-            LOGGER.debug("Error Code is: %s", errorcode)
-            LOGGER.debug("Message is: %s", messagekey)
+                    LOGGER.debug("Status Code is: %s", statuscode)
+                    LOGGER.debug("Error Code is: %s", errorcode)
+                    LOGGER.debug("Message is: %s", messagekey)
 
-            if errorcode is not None:
-                self.alarmstatus = errorcode
+                    if errorcode is not None:
+                        self.alarmstatus = errorcode
 
-            await self._logout()
+                    return
 
-            return
-
-        if response.status == 201:
-            try:
-                json = await response.json()
-                statuscode = json["statusCode"]
-                messagekey = json["messageKey"]
-                errorcode = json["errorCode"]
-
-            except aiohttp.ContentTypeError as error:
-                LOGGER.debug("ContentTypeError on ok status: %s", error.message)
+                LOGGER.debug("Did not retrieve information properly")
+                LOGGER.debug("request status: %s", response.status)
                 response_text = await response.text()
-                LOGGER.debug("Response (200) text is: %s", response_text)
-                await self._logout()
-                raise UpdateFailed from error
-
-            if statuscode == 6:
-                LOGGER.debug("Status code is 6 -> Toolong, aborting")
-                await self._logout()
-                self.alarmstatus = 0
+                LOGGER.debug("request text: %s", response_text)
                 raise UpdateFailed
 
-            LOGGER.debug("Status Code is: %s", statuscode)
-            LOGGER.debug("Error Code is: %s", errorcode)
-            LOGGER.debug("Message is: %s", messagekey)
-
-            if errorcode is not None:
-                self.alarmstatus = errorcode
-
-            await self._logout()
-            return
-
-        LOGGER.debug("Did not retrieve information properly")
-        LOGGER.debug("request status: %s", response.status)
-        response_text = await response.text()
-        LOGGER.debug("request text: %s", response_text)
-        await self._logout()
-        raise UpdateFailed
+            finally:
+                # Always cleanup local session state. This must never block the lock release.
+                await self._logout()
 
     async def _logout(self) -> None:
-        """Logout."""
+        """Logout and always clear local session state.
 
+        Network/DNS issues are common with this backend; logout failures must not
+        prevent future updates.
+        """
         LOGGER.debug("Logout")
 
-        async with asyncio.timeout(TIMEOUT):
-            await self.websession.get(
-                f"{TC20E_URL}/logout",
-                headers={
-                    "Connection": "keep-alive",
-                },
-            )
-        self._session_id = None
-        self.request = False
+        try:
+            async with asyncio.timeout(TIMEOUT):
+                await self.websession.get(
+                    f"{TC20E_URL}/logout",
+                    headers={
+                        "Connection": "keep-alive",
+                    },
+                )
+        except Exception as err:
+            # Logout errors should not block the coordinator.
+            LOGGER.debug("Logout failed (ignored): %s", err)
+        finally:
+            self._session_id = None
 
     async def _login(self) -> None:
         """Login and retrieve session id."""
-
         LOGGER.debug("Trying to login")
 
         async with asyncio.timeout(TIMEOUT):
@@ -300,14 +297,14 @@ class TC20EUpdateCoordinator(DataUpdateCoordinator):
             self._session_id = re.search(
                 r"homeSessionId='(.*?)'", soup.prettify()
             ).group(1)
-        except AttributeError:
+        except AttributeError as err:
             LOGGER.error("Failed to retrieve Session ID: %d", response.status)
-            await self._logout()
-            raise CannotConnectError from AttributeError
+            # Do not call _logout() here; _request() already guarantees cleanup in finally.
+            self._session_id = None
+            raise CannotConnectError from err
 
         if self._session_id is None:
             LOGGER.error("Failed to retrieve Session ID: %d", response.status)
-            await self._logout()
             raise CannotConnectError
 
         LOGGER.debug("Session id retrieved")
